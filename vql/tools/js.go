@@ -3,22 +3,17 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"runtime/debug"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/robertkrimen/otto"
-	_ "github.com/robertkrimen/otto/underscore"
+	"github.com/lithdew/quickjs"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
 
 var halt = errors.New("Halt")
-
-type JSCompileArgs struct {
-	JS  string `vfilter:"required,field=js,doc=The body of the javascript code."`
-	Key string `vfilter:"optional,field=key,doc=If set use this key to cache the JS VM."`
-}
 
 func logIfPanic(scope *vfilter.Scope) {
 	err := recover()
@@ -31,29 +26,143 @@ func logIfPanic(scope *vfilter.Scope) {
 	}
 }
 
+func check(err error) {
+	if err != nil {
+		var evalErr *quickjs.Error
+		if errors.As(err, &evalErr) {
+			fmt.Println(evalErr.Cause)
+			fmt.Println(evalErr.Stack)
+		}
+		panic(err)
+	}
+}
+
+func interfaceToValue(val reflect.Value, vm *quickjs.Context) quickjs.Value {
+	switch val.Kind() {
+	case reflect.Bool:
+		return vm.Bool(val.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return vm.Int64(val.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return vm.BigUint64(val.Uint())
+	case reflect.String:
+		return vm.String(val.String())
+	case reflect.Slice:
+		arr := vm.Array()
+		for i := 0; i < val.Len(); i++ {
+			arr.Set(string(i), interfaceToValue(val.Index(i), vm))
+		}
+		return arr
+	case reflect.Float32, reflect.Float64:
+		return vm.Float64(val.Float())
+	}
+
+	return vm.Null()
+}
+
+func valueToInterface(val quickjs.Value) interface{} {
+	defer val.Free()
+
+	if val.IsFunction() {
+		return vfilter.Null{}
+	}
+
+	if val.IsNumber() {
+		return val.Int64()
+	}
+
+	if val.IsBigInt() {
+		return val.BigInt()
+	}
+	if val.IsBigFloat() {
+		return val.BigFloat()
+	}
+	if val.IsBigDecimal() {
+		return val.BigFloat()
+	}
+	if val.IsBool() {
+		return val.Bool()
+	}
+	if val.IsNull() {
+		return vfilter.Null{}
+	}
+	if val.IsUndefined() {
+		return vfilter.Null{}
+	}
+	if val.IsString() {
+		return val.String()
+	}
+
+	if val.IsArray() {
+
+		names, err := val.PropertyNames()
+		check(err)
+
+		res := make([]interface{}, 0)
+		for _, name := range names {
+			if name.Atom.String() != "length" {
+				val := val.GetByAtom(name.Atom)
+				res = append(res, valueToInterface(val))
+			}
+
+		}
+		return res
+
+	}
+
+	if val.IsObject() {
+		names, err := val.PropertyNames()
+		check(err)
+
+		res := make(map[string]vfilter.Any)
+		for _, name := range names {
+			val := val.GetByAtom(name.Atom)
+			res[name.Atom.String()] = valueToInterface(val)
+		}
+		return res
+	}
+
+	return vfilter.Null{}
+}
+
+type JSCompileArgs struct {
+	JS  string `vfilter:"required,field=js,doc=The body of the javascript code."`
+	Key string `vfilter:"optional,field=key,doc=If set use this key to cache the JS VM."`
+}
+
 type JSCompile struct{}
 
 func getVM(ctx context.Context,
 	scope *vfilter.Scope,
-	key string) *otto.Otto {
+	key string) *quickjs.Context {
 	if key == "" {
 		key = "__jscontext"
 	}
 
-	vm, ok := vql_subsystem.CacheGet(scope, key).(*otto.Otto)
+	context, ok := vql_subsystem.CacheGet(scope, key).(*quickjs.Context)
 	if !ok {
-		vm = otto.New()
-		vm.Interrupt = make(chan func(), 1)
+		runtime := quickjs.NewRuntime()
+		context = runtime.NewContext()
+		globals := context.Globals()
+
+		vql_info := func(ctx *quickjs.Context, this quickjs.Value, args []quickjs.Value) quickjs.Value {
+			scope.Log("JSVM: %+v", args[0].String())
+			return ctx.Null()
+		}
+
+		console := context.Object()
+		console.SetByAtom(context.Atom("log"), context.Function(vql_info))
+		globals.Set("console", console)
+
 		go func() {
 			<-ctx.Done()
-			vm.Interrupt <- func() {
-				panic(halt)
-			}
+			context.Free()
+			runtime.Free()
 		}()
-		vql_subsystem.CacheSet(scope, key, vm)
+		vql_subsystem.CacheSet(scope, key, context)
 	}
 
-	return vm
+	return context
 }
 
 func (self *JSCompile) Call(ctx context.Context,
@@ -69,13 +178,11 @@ func (self *JSCompile) Call(ctx context.Context,
 	defer logIfPanic(scope)
 
 	vm := getVM(ctx, scope, arg.Key)
-	_, err = vm.Run(arg.JS)
-	if err != nil {
-		scope.Log("js: %s", err.Error())
-		return vfilter.Null{}
-	}
 
-	return vfilter.Null{}
+	result, err := vm.Eval(arg.JS)
+	check(err)
+
+	return valueToInterface(result)
 }
 
 func (self JSCompile) Info(scope *vfilter.Scope,
@@ -84,64 +191,6 @@ func (self JSCompile) Info(scope *vfilter.Scope,
 		Name:    "js",
 		Doc:     "Compile and run javascript code.",
 		ArgType: type_map.AddType(scope, &JSCompileArgs{}),
-	}
-}
-
-type JSCallArgs struct {
-	Func string      `vfilter:"required,field=func,doc=JS function to call."`
-	Args vfilter.Any `vfilter:"optional,field=args,doc=Positional args for the function."`
-	Key  string      `vfilter:"optional,field=key,doc=If set use this key to cache the JS VM."`
-}
-
-type JSCall struct{}
-
-func (self *JSCall) Call(ctx context.Context,
-	scope *vfilter.Scope,
-	args *ordereddict.Dict) vfilter.Any {
-	arg := &JSCallArgs{}
-	err := vfilter.ExtractArgs(scope, args, arg)
-	if err != nil {
-		scope.Log("js_call: %s", err.Error())
-		return vfilter.Null{}
-	}
-
-	defer logIfPanic(scope)
-
-	var call_args []interface{}
-
-	slice := reflect.ValueOf(arg.Args)
-
-	if arg.Args == nil {
-		call_args = nil
-	} else if slice.Type().Kind() != reflect.Slice {
-		call_args = append(call_args, arg.Args)
-	} else {
-		for i := 0; i < slice.Len(); i++ {
-			value := slice.Index(i).Interface()
-			call_args = append(call_args, value)
-		}
-	}
-
-	vm := getVM(ctx, scope, arg.Key)
-	value, err := vm.Call(arg.Func, nil, call_args...)
-	if err != nil {
-		scope.Log("js_call: %s", err.Error())
-		return vfilter.Null{}
-	}
-
-	result, _ := value.Export()
-	if result == nil {
-		result = vfilter.Null{}
-	}
-	return result
-}
-
-func (self JSCall) Info(scope *vfilter.Scope,
-	type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
-	return &vfilter.FunctionInfo{
-		Name:    "js_call",
-		Doc:     "Compile and run javascript code.",
-		ArgType: type_map.AddType(scope, &JSCallArgs{}),
 	}
 }
 
@@ -167,26 +216,7 @@ func (self *JSSet) Call(ctx context.Context,
 
 	vm := getVM(ctx, scope, arg.Key)
 
-	reflected := reflect.ValueOf(arg.Value)
-
-	// If this isn't a slice, feed the data as is.
-	if reflected.Type().Kind() != reflect.Slice {
-		err = vm.Set(arg.Var, reflected.Interface())
-	} else {
-		// If it is a slice convert to array of interfaces and push
-		var var_val []interface{}
-		for i := 0; i < reflected.Len(); i++ {
-			value := reflected.Index(i).Interface()
-			var_val = append(var_val, value)
-		}
-		err = vm.Set(arg.Var, var_val)
-
-	}
-
-	if err != nil {
-		scope.Log("js_set: %s", err.Error())
-		return vfilter.Null{}
-	}
+	vm.Globals().SetByAtom(vm.Atom(arg.Var), interfaceToValue(reflect.ValueOf(arg.Value), vm))
 
 	return vfilter.Null{}
 }
@@ -221,18 +251,9 @@ func (self *JSGet) Call(ctx context.Context,
 
 	vm := getVM(ctx, scope, arg.Key)
 
-	otto_val, err := vm.Get(arg.Var)
-	if err != nil {
-		scope.Log("js_get: %s", err.Error())
-		return vfilter.Null{}
-	}
-	value, err := otto_val.Export()
-	if err != nil {
-		scope.Log("js_get: %s", err.Error())
-		return vfilter.Null{}
-	}
+	val := vm.Globals().GetByAtom(vm.Atom(arg.Var))
 
-	return value
+	return valueToInterface(val)
 }
 
 func (self JSGet) Info(scope *vfilter.Scope,
@@ -245,7 +266,6 @@ func (self JSGet) Info(scope *vfilter.Scope,
 }
 
 func init() {
-	vql_subsystem.RegisterFunction(&JSCall{})
 	vql_subsystem.RegisterFunction(&JSCompile{})
 	vql_subsystem.RegisterFunction(&JSSet{})
 	vql_subsystem.RegisterFunction(&JSGet{})
